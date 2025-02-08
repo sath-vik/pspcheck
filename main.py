@@ -95,12 +95,22 @@ def eval(val_loader, model, args):
                   .format(idx + 1, evaluation['accuracy'], evaluation['mean_iou']))
 
             if args.result_save:
-                if not os.path.isdir('result'):
-                    os.mkdir('result')
-                pred = logit.squeeze().detach().cpu().numpy()
-                pred = decode_semantic_label(pred)
-                pred *= np.stack([(label.squeeze().detach().cpu().numpy() != 255).astype(float)] * 3, axis=-1)
-                cv2.imwrite('result/{}'.format(data['filename'][0]), pred.astype(np.uint8))
+              # Ensure result directory exists
+              if not os.path.isdir('result'):
+                  os.mkdir('result')
+              
+              # Ensure filename has a valid extension (e.g., .png)
+              filename = data['filename'][0]
+              if not filename.endswith('.png'):
+                  filename += '.png'
+              
+              pred = logit.squeeze().detach().cpu().numpy()
+              pred = decode_semantic_label(pred)
+              pred *= np.stack([(label.squeeze().detach().cpu().numpy() != 255).astype(float)] * 3, axis=-1)
+              
+              # Save the prediction
+              cv2.imwrite('result/{}'.format(filename), pred.astype(np.uint8))
+
 
 def main(args):
     train_loader, val_loader = load_data(args)
@@ -122,7 +132,7 @@ def main(args):
 
     if args.evaluation:
         # Load checkpoint for evaluation
-        checkpoint = torch.load('./checkpoint/checkpoint_model_50000.pth', map_location='cpu')
+        checkpoint = torch.load('./checkpoint/checkpoint_model_4000.pth', map_location='cpu')
         model.load_state_dict(checkpoint['model_state_dict'])
         eval(val_loader, model, args)
     else:

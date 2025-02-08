@@ -104,13 +104,14 @@ def eval(val_loader, model, args):
 
 def main(args):
     train_loader, val_loader = load_data(args)
-    # Uncomment and modify if you want to calculate class weights for Cityscapes:
+    # Uncomment and modify next line if you want to calculate class weights for Cityscapes:
     # args.weight_labels = torch.tensor(calculate_weigths_labels(args.dataset, train_loader, args.n_classes)).float()
     if args.cuda:
         # args.weight_labels = args.weight_labels.cuda()
         pass
 
-    model = PSPNet()
+    # Pass the proper number of classes (e.g., 19 for Cityscapes) to the model.
+    model = PSPNet(n_classes=args.n_classes)
     if args.cuda:
         model = model.cuda()
     if args.distributed:
@@ -120,12 +121,14 @@ def main(args):
                                                     find_unused_parameters=True)
 
     if args.evaluation:
+        # Load checkpoint for evaluation
         checkpoint = torch.load('./checkpoint/checkpoint_model_50000.pth', map_location='cpu')
         model.load_state_dict(checkpoint['model_state_dict'])
         eval(val_loader, model, args)
     else:
         criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_mask, weight=None).cuda()
 
+        # Separate parameters into backbone and decoder groups for differential learning rate.
         backbone_params = nn.ParameterList()
         decoder_params = nn.ParameterList()
 

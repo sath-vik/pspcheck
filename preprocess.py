@@ -11,7 +11,6 @@ from torchvision import transforms
 
 from utils import *
 
-
 class VOC2012Dataset(data.Dataset):
     def __init__(self, args=None, transform=None, random_horizontal_flip=True,
                  random_gaussian_blur=True, random_enhance=True, split='trainaug'):
@@ -128,8 +127,19 @@ class CityscapesDataset(data.Dataset):
         image = np.load(img_path)   # Expected shape: H x W x Channels
         label = np.load(label_path)   # Expected shape: H x W
 
-        # Remap ignore label from 255 to -100 to be compatible with the loss (ignore_index)
-        label[label == 255] = -100
+        # Remap Cityscapes labels to train IDs.
+        # Mapping: 7->0, 8->1, 11->2, 12->3, 13->4, 17->5, 19->6, 20->7,
+        # 21->8, 22->9, 23->10, 24->11, 25->12, 26->13, 27->14, 28->15, 31->16, 32->17, 33->18.
+        cityscapes_mapping = {
+            7: 0, 8: 1, 11: 2, 12: 3, 13: 4, 17: 5, 19: 6, 20: 7,
+            21: 8, 22: 9, 23: 10, 24: 11, 25: 12, 26: 13, 27: 14,
+            28: 15, 31: 16, 32: 17, 33: 18
+        }
+        # Create a new label where unmapped values (or originally 255) are set to ignore (-100)
+        new_label = np.ones_like(label) * -100
+        for orig_val, train_id in cityscapes_mapping.items():
+            new_label[label == orig_val] = train_id
+        label = new_label
 
         sample = {'image': {'original_scale': image},
                   'label': {'semantic_logit': label},

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 import numpy as np
 np.seterr(divide='ignore', invalid='ignore')
@@ -252,7 +253,8 @@ def calculate_weigths_labels(dataset, dataloader, num_classes):
     # Create an instance from the data loader
     z = np.zeros((num_classes,))
     # Initialize tqdm
-    tqdm_batch = tqdm(dataloader)
+    tqdm_batch = tqdm(dataloader, desc="Processing Labels")
+    # tqdm_batch = tqdm(dataloader)
     print('Calculating classes weights')
     for sample in tqdm_batch:
         y = sample['label']['semantic_logit']
@@ -322,63 +324,135 @@ class SegmentationLosses(object):
 
 
 class SemanticSegmentationMetrics:
+    """
+    A class to compute semantic segmentation metrics such as:
+    - Pixel Accuracy
+    - Mean Pixel Accuracy
+    - IoU per Class
+    - Mean IoU (mIoU)
+    """
+
     def __init__(self, FLAGS):
-        self.class_num = FLAGS.n_classes
-        self.ignore_mask = FLAGS.ignore_mask
-        self.confusion_matrix = np.zeros((self.class_num, self.class_num))
-        self.class_iou = []
-        self.mean_iou = 0.0
-        self.accuracy = 0.0
+        """
+        Initialize the metrics class.
 
-    def __call__(self, prediction, label, mode='train'):
-        # prediction = prediction['semantic_logit']
-        # label = label['semantic_logit']
+        Args:
+            FLAGS: Configuration object with the following attributes:
+                - n_classes: Number of classes in the dataset.
+                - ignore_mask: Value in the label to ignore during evaluation.
+        """
+        self.class_num = FLAGS.n_classes  # Number of classes
+        self.ignore_mask = FLAGS.ignore_mask  # Ignore mask value
+        self.confusion_matrix = np.zeros((self.class_num, self.class_num))  # Confusion matrix
 
+    def __call__(self, prediction, label):
+        """
+        Update the confusion matrix with predictions and ground truth labels.
+
+        Args:
+            prediction: Tensor of model predictions.
+            label: Tensor of ground truth labels.
+        """
         self.compute_confusion_matrix_and_add_up(label, prediction)
-        if mode == 'train':
-            accuracy = self.compute_pixel_accuracy()
-            metric_dict = {'accuracy': accuracy}
-        else:
-            class_iou = self.compute_class_iou()
-            mean_iou = self.compute_mean_iou()
-            accuracy = self.compute_pixel_accuracy()
-            metric_dict = {'mean_iou': mean_iou, 'accuracy': accuracy} #, 'class_iou': dict()}
-            # for i, iou in enumerate(class_iou):
-            #     metric_dict['class_iou']['class_' + str(i)] = iou
-        return metric_dict
 
     def clear(self):
+        """Reset the confusion matrix."""
         self.confusion_matrix = np.zeros((self.class_num, self.class_num))
 
-    def compute_confusion_matrix(self, label, image):
-        if len(label.shape) == 4:
+    def compute_confusion_matrix(self, label, prediction):
+        """
+        Compute the confusion matrix for a batch of predictions and labels.
+
+        Args:
+            label: Tensor of ground truth labels.
+            prediction: Tensor of model predictions.
+
+        Returns:
+            Confusion matrix for the current batch.
+        """
+        # Ensure labels and predictions are in the correct shape
+        if len(label.shape) == 4:  # If one-hot encoded
             label = torch.argmax(label, dim=1)
-        if len(image.shape) == 4:
-            image = torch.argmax(image, dim=1)
+        if len(prediction.shape) == 4:
+            prediction = torch.argmax(prediction, dim=1)
 
+        # Flatten tensors and convert to numpy arrays
         label = label.flatten().cpu().numpy().astype(np.int64)
-        image = image.flatten().cpu().numpy().astype(np.int64)
+        prediction = prediction.flatten().cpu().numpy().astype(np.int64)
 
+        # Mask out invalid indices (e.g., ignore mask or out-of-range values)
         valid_indices = (label != self.ignore_mask) & (0 <= label) & (label < self.class_num)
 
-        enhanced_label = self.class_num * label[valid_indices].astype(np.int32) + image[valid_indices]
+        # Map valid indices into a single array for bincounting
+        enhanced_label = self.class_num * label[valid_indices].astype(np.int32) + prediction[valid_indices]
+        
+        # Compute confusion matrix using bincount
         confusion_matrix = np.bincount(enhanced_label, minlength=self.class_num * self.class_num)
         confusion_matrix = np.reshape(confusion_matrix, (self.class_num, self.class_num))
 
         return confusion_matrix
 
-    def compute_confusion_matrix_and_add_up(self, label, image):
-        self.confusion_matrix += self.compute_confusion_matrix(label, image)
+    def compute_confusion_matrix_and_add_up(self, label, prediction):
+        """
+        Update the global confusion matrix with a new batch.
 
-    def compute_pixel_accuracy(self):
+        Args:
+            label: Ground truth labels.
+            prediction: Model predictions.
+        """
+        self.confusion_matrix += self.compute_confusion_matrix(label, prediction)
+
+    def get_pixel_accuracy(self):
+        """
+        Compute overall pixel accuracy.
+
+        Returns:
+            Pixel accuracy as a float.
+        """
         return np.sum(np.diag(self.confusion_matrix)) / np.sum(self.confusion_matrix)
 
-    def compute_class_iou(self):
-        class_iou = np.diag(self.confusion_matrix) / (
-                    np.sum(self.confusion_matrix, axis=0) + np.sum(self.confusion_matrix, axis=1) - np.diag(
-                self.confusion_matrix))
-        return class_iou
+    def get_mean_pixel_accuracy(self):
+        """
+        Compute mean pixel accuracy across all classes.
 
-    def compute_mean_iou(self):
-        class_iou = self.compute_class_iou()
-        return np.nanmean(class_iou)
+        Returns:
+            Mean pixel accuracy as a float.
+            Ignores classes with no ground truth pixels to avoid `nan`.
+        """
+        per_class_accuracy = np.diag(self.confusion_matrix) / np.sum(self.confusion_matrix, axis=1)
+        
+        # Replace nan values with 0 for classes without ground truth pixels
+        per_class_accuracy = np.nan_to_num(per_class_accuracy)
+
+        return np.mean(per_class_accuracy)
+
+    def get_iou_per_class(self):
+        """
+        Compute Intersection over Union (IoU) for each class.
+
+        Returns:
+            A numpy array containing IoU for each class.
+            Classes without valid pixels will have IoU set to 0.
+        """
+        iou_per_class = np.diag(self.confusion_matrix) / (
+            np.sum(self.confusion_matrix, axis=0) + 
+            np.sum(self.confusion_matrix, axis=1) - 
+            np.diag(self.confusion_matrix)
+        )
+        
+        # Replace nan values with 0 for classes without valid pixels
+        iou_per_class = np.nan_to_num(iou_per_class)
+
+        return iou_per_class
+
+    def get_mean_iou(self):
+        """
+        Compute mean Intersection over Union (mIoU).
+
+        Returns:
+            Mean IoU as a float. Ignores invalid classes during computation.
+        """
+        iou_per_class = self.get_iou_per_class()
+        
+        # Compute mean IoU only for valid classes (non-zero denominators)
+        return np.mean(iou_per_class)

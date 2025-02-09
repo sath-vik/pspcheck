@@ -27,7 +27,7 @@ def download_model(url, id):
             urllib.urlretrieve(url, filename=model_path, reporthook=t.update_to)
     else:
         print('Already downloaded:', id)
-    state_dict = torch.load(model_path)
+    state_dict = torch.load(model_path, weights_only=True)
     return state_dict
 
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):

@@ -15,7 +15,7 @@ def load_config():
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--gamma', type=float, default=0.9)
-    parser.add_argument('--max_iteration', type=int, default=2001)
+    parser.add_argument('--max_iteration', type=int, default=1)
     parser.add_argument('--warmup_iteration', type=int, default=1500)
     parser.add_argument('--intervals', type=int, default=2000)
     parser.add_argument('--num_workers', type=int, default=4,

@@ -13,13 +13,16 @@ import cv2
 def save_checkpoint(model, optimizer, scheduler, args, global_step, scope=None):
     if scope is None:
         scope = global_step
+    checkpoint_dir = 'checkpoint'
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_{scope}.pth')
     if not args.distributed or args.local_rank == 0:
         torch.save({
             'model_state_dict': model.state_dict(),
             'global_step': global_step,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict()
-        }, os.path.join('checkpoint', f'checkpoint_{scope}.pth'))
+        }, checkpoint_path)
 
 class PolyLr(_LRScheduler):
     def __init__(self, optimizer, gamma, max_iteration, warmup_iteration=0):
@@ -68,8 +71,8 @@ def train(global_step, train_loader, model, optimizer, criterion, scheduler, arg
         if global_step % 10 == 0:
             print(f'[Step {global_step}] Loss: {loss.item():.4f} | LR: {current_lr:.6f}')
             
-        if global_step % 1000 == 0:
-            save_checkpoint(model, optimizer, scheduler, args, global_step)
+        if global_step % 100 == 0:
+            save_checkpoint(model, optimizer, scheduler, args, global_step, scope='final')
             
         global_step += 1
 
@@ -92,9 +95,12 @@ def evaluate(model, loader, args):
             metric.update(outputs, label)
 
             if args.result_save:
-                pred = outputs.argmax(1).squeeze().cpu().numpy()
-                filename = data['filename'][0].replace('/', '_')
-                cv2.imwrite(f"result/{filename}.png", pred.astype(np.uint8))
+                preds = outputs.argmax(1).cpu().numpy()
+                filenames = data['filename']
+                for i in range(len(filenames)):
+                    pred = preds[i]
+                    filename = filenames[i].replace('/', '_')
+                    cv2.imwrite(os.path.join('result', f"{filename}.png"), pred.astype(np.uint8))
 
     return {
         'mean_iou': metric.get_miou(),
@@ -105,28 +111,23 @@ def evaluate(model, loader, args):
 def main():
     args = load_config()
     
-    # Setup directories
     os.makedirs('checkpoint', exist_ok=True)
     os.makedirs('logs', exist_ok=True)
     if args.result_save:
         os.makedirs('result', exist_ok=True)
 
-    # Load data
     train_loader, val_loader, test_loader = load_data(args)
 
-    # Initialize model
     model = PSPNet(n_classes=args.n_classes)
     if args.cuda:
         model = model.cuda()
 
-    # Class weights and loss
     class_weights = calculate_class_weights(train_loader, args.n_classes)
     criterion = SegmentationLosses(
         weight=class_weights.cuda() if args.cuda else class_weights,
         ignore_index=255
     )
     
-    # Optimizer and scheduler
     optimizer = optim.SGD([
         {'params': model.backbone.parameters(), 'lr': args.lr},
         {'params': model.decoder.parameters(), 'lr': args.lr * 10}
@@ -135,7 +136,6 @@ def main():
     scheduler = PolyLr(optimizer, args.gamma, args.max_iteration, args.warmup_iteration)
     logger = CSVTrainLogger('logs/training_log.csv')
 
-    # Training loop
     best_iou = 0.0
     global_step = 0
     try:
@@ -151,14 +151,13 @@ def main():
                 
                 if val_metrics['mean_iou'] > best_iou:
                     best_iou = val_metrics['mean_iou']
-                    save_checkpoint(model, optimizer, scheduler, args, global_step, 'best')
+                    save_checkpoint(model, optimizer, scheduler, args, global_step, scope='best')
 
     except KeyboardInterrupt:
         print("\nTraining interrupted!")
 
-    # Final evaluation
     print("\n=== Loading best model ===")
-    checkpoint = torch.load('checkpoint/checkpoint_final.pth.pth', 
+    checkpoint = torch.load('checkpoint/checkpoint_final.pth', 
                           map_location='cuda' if args.cuda else 'cpu')
     model.load_state_dict(checkpoint['model_state_dict'])
     
@@ -171,7 +170,7 @@ def main():
     for idx, iou in enumerate(test_metrics['class_iou']):
         print(f"Class {idx:02d}: {iou:.4f}")
 
-    save_checkpoint(model, optimizer, scheduler, args, global_step, 'final')
+    save_checkpoint(model, optimizer, scheduler, args, global_step, scope='final')
 
 if __name__ == '__main__':
     main()

@@ -8,11 +8,9 @@ import csv
 from datetime import datetime
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 
-# Suppress numpy warnings for cleaner output
 np.seterr(divide='ignore', invalid='ignore')
 
 class AverageMeter:
-    """Computes and stores average and current values"""
     def __init__(self):
         self.reset()
         
@@ -29,14 +27,12 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 def accuracy(output, target):
-    """Computes pixel accuracy"""
     with torch.no_grad():
         pred = torch.argmax(output, dim=1)
         correct = (pred == target).sum().item()
     return correct / target.numel()
 
 class Normalize:
-    """Normalizes image with mean and std"""
     def __init__(self, mean, std):
         self.mean = np.array(mean, dtype=np.float32)
         self.std = np.array(std, dtype=np.float32)
@@ -48,17 +44,14 @@ class Normalize:
         return sample
 
 class ToTensor:
-    """Converts numpy arrays to tensors"""
     def __call__(self, sample):
         image = sample['image']['original_scale'].transpose(2, 0, 1)
         label = sample['label']['semantic_logit']
-        
         sample['image']['original_scale'] = torch.from_numpy(image).float()
         sample['label']['semantic_logit'] = torch.from_numpy(label).long()
         return sample
 
 class RandomHorizontalFlip:
-    """Randomly flip image and label horizontally"""
     def __call__(self, sample):
         if np.random.random() < 0.5:
             image = np.fliplr(sample['image']['original_scale'])
@@ -68,7 +61,6 @@ class RandomHorizontalFlip:
         return sample
 
 class RandomScaleRandomCrop:
-    """Random scale and crop augmentation"""
     def __init__(self, base_size=2048, crop_size=473, scale_range=(0.5, 2.0)):
         self.crop_size = (crop_size, crop_size)
         self.scale_range = scale_range
@@ -78,13 +70,11 @@ class RandomScaleRandomCrop:
         img = Image.fromarray(sample['image']['original_scale'])
         lbl = Image.fromarray(sample['label']['semantic_logit'].astype(np.uint8))
 
-        # Random scale
         scale = np.random.uniform(*self.scale_range)
         w, h = int(img.width * scale), int(img.height * scale)
         img = img.resize((w, h), Image.BILINEAR)
         lbl = lbl.resize((w, h), Image.NEAREST)
 
-        # Random crop
         x = np.random.randint(0, w - self.crop_size[0])
         y = np.random.randint(0, h - self.crop_size[1])
         img = img.crop((x, y, x+self.crop_size[0], y+self.crop_size[1]))
@@ -95,7 +85,6 @@ class RandomScaleRandomCrop:
         return sample
 
 class FixedScaleCenterCrop:
-    """Center crop after scaling for validation"""
     def __init__(self, crop_size=473):
         self.crop_size = (crop_size, crop_size)
 
@@ -103,14 +92,12 @@ class FixedScaleCenterCrop:
         img = Image.fromarray(sample['image']['original_scale'])
         lbl = Image.fromarray(sample['label']['semantic_logit'].astype(np.uint8))
 
-        # Scale maintaining aspect ratio
         w, h = img.size
         ratio = min(self.crop_size[0]/w, self.crop_size[1]/h)
         new_w, new_h = int(w*ratio), int(h*ratio)
         img = img.resize((new_w, new_h), Image.BILINEAR)
         lbl = lbl.resize((new_w, new_h), Image.NEAREST)
 
-        # Center crop
         x = (new_w - self.crop_size[0]) // 2
         y = (new_h - self.crop_size[1]) // 2
         img = img.crop((x, y, x+self.crop_size[0], y+self.crop_size[1]))
@@ -121,7 +108,6 @@ class FixedScaleCenterCrop:
         return sample
 
 def calculate_class_weights(dataloader, num_classes=19, ignore_index=255):
-    """Calculate class weights for imbalanced dataset"""
     class_counts = np.zeros(num_classes, dtype=np.float32)
     
     print("Calculating class weights...")
@@ -129,14 +115,13 @@ def calculate_class_weights(dataloader, num_classes=19, ignore_index=255):
         labels = batch['label']['semantic_logit'].numpy()
         valid = (labels != ignore_index)
         counts = np.bincount(labels[valid], minlength=num_classes)
-        class_counts += counts + 1e-6  # Add smoothing
+        class_counts += counts + 1e-6
 
     class_weights = 1 / np.log(1.02 + class_counts / class_counts.sum())
-    class_weights /= class_weights.min()  # Normalize
+    class_weights /= class_weights.min()
     return torch.from_numpy(class_weights).float()
 
 class SegmentationLosses:
-    """Loss functions with class weighting and ignore index"""
     def __init__(self, weight=None, ignore_index=255):
         self.criterion = nn.CrossEntropyLoss(
             weight=weight,
@@ -148,14 +133,12 @@ class SegmentationLosses:
         return self.criterion(outputs, targets)
 
 class SemanticSegmentationMetrics:
-    """Metrics calculator for segmentation tasks"""
     def __init__(self, num_classes=19, ignore_index=255):
         self.num_classes = num_classes
         self.ignore_index = ignore_index
         self.confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
 
     def update(self, preds, targets):
-        """Update confusion matrix with new predictions"""
         preds = torch.argmax(preds, 1).cpu().numpy().flatten()
         targets = targets.cpu().numpy().flatten()
         
@@ -169,20 +152,22 @@ class SemanticSegmentationMetrics:
         self.confusion_matrix.fill(0)
 
     def get_iou(self):
-        """Calculate Intersection over Union per class"""
         intersection = np.diag(self.confusion_matrix)
         union = self.confusion_matrix.sum(0) + self.confusion_matrix.sum(1) - intersection
         iou = intersection / (union + 1e-8)
         return iou
 
     def get_miou(self):
-        """Calculate mean IoU excluding ignore index"""
         iou = self.get_iou()
         valid = np.where(iou >= 0)[0]
         return np.mean(iou[valid])
+    
+    def get_pixel_accuracy(self):
+        correct = self.confusion_matrix.trace()
+        total = self.confusion_matrix.sum()
+        return correct / (total + 1e-8)
 
 class CSVTrainLogger:
-    """Training metrics logger"""
     def __init__(self, filename='training_log.csv'):
         self.filename = filename
         self._create_header()

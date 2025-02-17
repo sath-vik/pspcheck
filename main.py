@@ -2,207 +2,176 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import _LRScheduler
-from tqdm import tqdm
-
 from model import PSPNet
 from config import load_config
 from preprocess import load_data
-from dataset.prepare_voc import decode_semantic_label
-from utils import SegmentationLosses, calculate_weigths_labels, SemanticSegmentationMetrics
-
+from utils import SegmentationLosses, calculate_class_weights, SemanticSegmentationMetrics, CSVTrainLogger
 import os
 import numpy as np
 import cv2
-
 
 def save_checkpoint(model, optimizer, scheduler, args, global_step, scope=None):
     if scope is None:
         scope = global_step
     if not args.distributed or args.local_rank == 0:
-        if args.device_num > 1:
-            model_state_dict = model.module.state_dict()
-        else:
-            model_state_dict = model.state_dict()
         torch.save({
-            'model_state_dict': model_state_dict,
+            'model_state_dict': model.state_dict(),
             'global_step': global_step,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict()
-        }, os.path.join('checkpoint', 'checkpoint_model_{}.pth'.format(scope)))
-
+        }, os.path.join('checkpoint', f'checkpoint_{scope}.pth'))
 
 class PolyLr(_LRScheduler):
-    def __init__(self, optimizer, gamma, max_iteration, warmup_iteration=0, last_epoch=-1):
+    def __init__(self, optimizer, gamma, max_iteration, warmup_iteration=0):
         self.gamma = gamma
         self.max_iteration = max_iteration
         self.warmup_iteration = warmup_iteration
-        super(PolyLr, self).__init__(optimizer, last_epoch)
-
-    def poly_lr(self, base_lr, step):
-        return base_lr * ((1 - (step / self.max_iteration)) ** (self.gamma))
-
-    def warmup_lr(self, base_lr, alpha):
-        return base_lr * (1 / 10.0 * (1 - alpha) + alpha)
+        super().__init__(optimizer)
 
     def get_lr(self):
         if self.last_epoch < self.warmup_iteration:
             alpha = self.last_epoch / self.warmup_iteration
-            lrs = [min(self.warmup_lr(base_lr, alpha), self.poly_lr(base_lr, self.last_epoch))
-                   for base_lr in self.base_lrs]
-        else:
-            lrs = [self.poly_lr(base_lr, self.last_epoch) for base_lr in self.base_lrs]
-        return lrs
+            return [base_lr * (0.1 * (1 - alpha) + alpha) for base_lr in self.base_lrs]
+        return [base_lr * ((1 - (self.last_epoch / self.max_iteration)) ** self.gamma) for base_lr in self.base_lrs]
 
-
-def train(global_step, train_loader, model, optimizer, criterion, scheduler, args):
+def train(global_step, train_loader, model, optimizer, criterion, scheduler, args, logger):
     model.train()
-    metric = SemanticSegmentationMetrics(args)
+    metric = SemanticSegmentationMetrics(num_classes=args.n_classes, ignore_index=255)
+    total_loss = 0.0
+    total_samples = 0
+    
     for data in train_loader:
         if global_step > args.max_iteration:
             break
-        print('[Global Step: {0}]'.format(global_step), end=' ')
-        img, label = data['image'], data['label']['semantic_logit']
-
-        if args.cuda:
-            for key in img.keys():
-                img[key] = img[key].cuda()
-            label = label.cuda()
-
-        # logit, loss = model(img, label.long())
-        # metric(logit, label)  # Update confusion matrix
-        # accuracy = metric.get_pixel_accuracy()
-        # # evaluation = metric(logit, label)
-        # print('[Loss: {0:.4f}], [Accuracy: {:.5f}]'.format(loss.item(), accuracy))
-        logit, loss = model(img, label.long())  # Assumes model returns both logits and loss
-
-        # Update confusion matrix
-        metric(logit.argmax(dim=1), label)
-
-        # Compute metrics after updating confusion matrix
-        accuracy = metric.get_pixel_accuracy()  # Overall pixel accuracy
+            
+        img = data['image']['original_scale']
+        label = data['label']['semantic_logit']
+        batch_size = img.size(0)
         
-        print(f'[Loss: {loss.item():.4f}], [Accuracy: {accuracy:.5f}]')
+        if args.cuda:
+            img = img.cuda(non_blocking=True)
+            label = label.cuda(non_blocking=True)
 
         optimizer.zero_grad()
+        outputs = model({'original_scale': img})
+        loss = criterion(outputs, label.long())
+        
         loss.backward()
         optimizer.step()
         scheduler.step()
-        if global_step % args.intervals == 0:
+
+        metric.update(outputs, label)
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
+
+        current_lr = scheduler.get_last_lr()[0]
+        if global_step % 10 == 0:
+            print(f'[Step {global_step}] Loss: {loss.item():.4f} | LR: {current_lr:.6f}')
+            
+        if global_step % 1000 == 0:
             save_checkpoint(model, optimizer, scheduler, args, global_step)
+            
         global_step += 1
-    return global_step
 
+    return global_step, total_loss/total_samples, metric.get_miou(), scheduler.get_last_lr()[0]
 
-def eval(val_loader, model, args):
-    metric = SemanticSegmentationMetrics(args)
-    metric.clear()
+def evaluate(model, loader, args):
+    metric = SemanticSegmentationMetrics(num_classes=args.n_classes, ignore_index=255)
     model.eval()
-
+    
     with torch.no_grad():
-        for idx, data in enumerate(val_loader):
-            img, label = data['image'], data['label']['semantic_logit']
+        for data in loader:
+            img = data['image']['original_scale']
+            label = data['label']['semantic_logit']
+            
             if args.cuda:
-                for key in img.keys():
-                    img[key] = img[key].cuda()
-                label = label.cuda()
+                img = img.cuda(non_blocking=True)
+                label = label.cuda(non_blocking=True)
 
-            logit = model(img)
-            metric(logit.argmax(dim=1), label)
+            outputs = model({'original_scale': img})
+            metric.update(outputs, label)
 
-            # Save predictions if enabled
             if args.result_save:
-                if not os.path.isdir('result'):
-                    os.mkdir('result')
-                pred = logit.argmax(dim=1).squeeze().detach().cpu().numpy()
-                pred = decode_semantic_label(pred)
-                filename = data['filename'][0]
-                if not filename.endswith('.png'):
-                    filename += '.png'
-                cv2.imwrite(f'result/{filename}', pred.astype(np.uint8))
+                pred = outputs.argmax(1).squeeze().cpu().numpy()
+                filename = data['filename'][0].replace('/', '_')
+                cv2.imwrite(f"result/{filename}.png", pred.astype(np.uint8))
 
-        # Compute final metrics after all validation samples are processed
-        iou_per_class = metric.get_iou_per_class()  # IoU for each class
-        mean_iou = metric.get_mean_iou()  # Mean IoU (mIoU)
-        pixel_acc = metric.get_pixel_accuracy()  # Overall Pixel Accuracy
-        mean_pixel_acc = metric.get_mean_pixel_accuracy()  # Mean Pixel Accuracy
+    return {
+        'mean_iou': metric.get_miou(),
+        'class_iou': metric.get_iou(),
+        'pixel_acc': metric.get_pixel_accuracy()
+    }
 
-        # Print metrics summary
-        print("\nEvaluation Metrics:")
-        print(f"Pixel Accuracy: {pixel_acc:.4f}")
-        print(f"Mean Pixel Accuracy: {mean_pixel_acc:.4f}")
-        print(f"Mean IoU (mIoU): {mean_iou:.4f}")
-        
-        print("Class-wise IoU:")
-        for i, iou in enumerate(iou_per_class):
-            print(f"  Class {i}: IoU = {iou:.4f}")
+def main():
+    args = load_config()
+    
+    # Setup directories
+    os.makedirs('checkpoint', exist_ok=True)
+    os.makedirs('logs', exist_ok=True)
+    if args.result_save:
+        os.makedirs('result', exist_ok=True)
 
+    # Load data
+    train_loader, val_loader, test_loader = load_data(args)
 
-def main(args):
-    train_loader, val_loader = load_data(args)
-    if args.cuda:
-        pass
-
-    # Initialize the PSPNet model with the correct number of classes.
+    # Initialize model
     model = PSPNet(n_classes=args.n_classes)
     if args.cuda:
         model = model.cuda()
-    if args.distributed:
-        model = nn.parallel.DistributedDataParallel(
-            nn.SyncBatchNorm.convert_sync_batchnorm(model),
-            device_ids=[args.local_rank],
-            output_device=args.local_rank,
-            find_unused_parameters=True,
-        )
 
-    if args.evaluation:
-        checkpoint_path = './checkpoint/checkpoint_model_6000.pth'
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        
-        eval(val_loader, model, args)
-    else:
-        class_weights = calculate_weigths_labels(args.dataset, train_loader, args.n_classes)
-        criterion = nn.CrossEntropyLoss(
-            weight=torch.tensor(class_weights).cuda(),  # Apply class weights
-            ignore_index=args.ignore_mask  # Ignore invalid labels
-        )
+    # Class weights and loss
+    class_weights = calculate_class_weights(train_loader, args.n_classes)
+    criterion = SegmentationLosses(
+        weight=class_weights.cuda() if args.cuda else class_weights,
+        ignore_index=255
+    )
+    
+    # Optimizer and scheduler
+    optimizer = optim.SGD([
+        {'params': model.backbone.parameters(), 'lr': args.lr},
+        {'params': model.decoder.parameters(), 'lr': args.lr * 10}
+    ], momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
+    
+    scheduler = PolyLr(optimizer, args.gamma, args.max_iteration, args.warmup_iteration)
+    logger = CSVTrainLogger('logs/training_log.csv')
 
-        backbone_params = nn.ParameterList()
-        decoder_params = nn.ParameterList()
-
-        for name, param in model.named_parameters():
-            if 'backbone' in name:
-                backbone_params.append(param)
-            else:
-                decoder_params.append(param)
-
-        params_list = [{'params': backbone_params},
-                       {'params': decoder_params, 'lr': args.lr * 10}]
-
-        optimizer = optim.SGD(params_list,
-                              lr=args.lr,
-                              momentum=args.momentum,
-                              weight_decay=args.weight_decay,
-                              nesterov=True)
-
-        scheduler = PolyLr(optimizer,
-                           gamma=args.gamma,
-                           max_iteration=args.max_iteration,
-                           warmup_iteration=args.warmup_iteration)
-
-        global_step = 0
-        if not os.path.isdir('checkpoint'):
-            os.mkdir('checkpoint')
-
+    # Training loop
+    best_iou = 0.0
+    global_step = 0
+    try:
         while global_step < args.max_iteration:
-            global_step = train(global_step,
-                                train_loader,
-                                model,
-                                optimizer,
-                                criterion,
-                                scheduler,
-                                args)
+            global_step, train_loss, train_iou, lr = train(
+                global_step, train_loader, model, optimizer, criterion, scheduler, args, logger
+            )
+
+            if global_step % args.intervals == 0:
+                val_metrics = evaluate(model, val_loader, args)
+                print(f"\nValidation @ {global_step}:")
+                print(f"mIoU: {val_metrics['mean_iou']:.4f}")
+                
+                if val_metrics['mean_iou'] > best_iou:
+                    best_iou = val_metrics['mean_iou']
+                    save_checkpoint(model, optimizer, scheduler, args, global_step, 'best')
+
+    except KeyboardInterrupt:
+        print("\nTraining interrupted!")
+
+    # Final evaluation
+    print("\n=== Loading best model ===")
+    checkpoint = torch.load('checkpoint/checkpoint_final.pth.pth', 
+                          map_location='cuda' if args.cuda else 'cpu')
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    test_metrics = evaluate(model, test_loader, args)
+    
+    print("\n=== Test Results ===")
+    print(f"Mean IoU: {test_metrics['mean_iou']:.4f}")
+    print(f"Pixel Accuracy: {test_metrics['pixel_acc']:.4f}")
+    print("\nClass-wise IoU:")
+    for idx, iou in enumerate(test_metrics['class_iou']):
+        print(f"Class {idx:02d}: {iou:.4f}")
+
+    save_checkpoint(model, optimizer, scheduler, args, global_step, 'final')
 
 if __name__ == '__main__':
-    args = load_config()
-    main(args)
+    main()

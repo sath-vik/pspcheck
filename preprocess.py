@@ -1,134 +1,187 @@
+from torch.utils.data import DataLoader, random_split
+from torch.utils import data
+from torchvision import transforms
+import torch.distributed as dist
 import os
-from collections import defaultdict
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
-from torchvision import transforms
-import cv2
 
-class CityscapesDataset(Dataset):
-    def __init__(self, args=None, transform=None, split='train'):
-        self.base_dir = args.data_root if args else './cityscapes_data/data'
+from utils import (
+    RandomHorizontalFlip,
+    RandomGaussianBlur,
+    RandomEnhance,
+    RandomScaleRandomCrop,
+    Normalize,
+    ToTensor,
+    MultiScale,
+    Flip,
+    FixedScaleCenterCrop
+)
+
+class CityscapesDataset(data.Dataset):
+    def __init__(self, root_dir='cityscapes_data/data', split='train', 
+                 transform=None, random_horizontal_flip=True,
+                 random_gaussian_blur=True, random_enhance=True):
+        
+        self.root_dir = root_dir
         self.split = split
-        self.image_dir = os.path.join(self.base_dir, split, 'image')
-        self.label_dir = os.path.join(self.base_dir, split, 'label')
-        self.file_list = sorted([f for f in os.listdir(self.image_dir) if f.endswith('.npy')])
+        self.image_dir = os.path.join(root_dir, split, 'image')
+        self.label_dir = os.path.join(root_dir, split, 'label')
+        self.filenames = [f for f in os.listdir(self.image_dir) if f.endswith('.npy')]
 
-        # Updated class mapping (19 classes + ignore)
-        self.class_mapping = {
-            0: 0,    # road
-            1: 1,    # sidewalk
-            2: 2,    # building
-            3: 3,    # wall
-            4: 4,    # fence
-            5: 5,    # pole
-            6: 6,    # traffic light
-            7: 7,    # traffic sign
-            8: 8,    # vegetation
-            9: 9,    # terrain
-            10: 10,  # sky
-            11: 11,  # person
-            12: 12,  # rider
-            13: 13,  # car
-            14: 14,  # truck
-            15: 15,  # bus
-            16: 16,  # motorcycle
-            17: 17,  # bicycle
-            255: 255 # ignore
-        }
-        # Ensure all possible values are mapped
-        self.class_mapping = defaultdict(lambda: 255, self.class_mapping)
-        self.transform = transform or transforms.Compose([
-            Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ToTensor()
-        ])
-        # unique_vals = set()
-        # for mask_file in self.mask_files:
-        #     mask = np.load(os.path.join(self.label_dir, mask_file))
-        #     unique_vals.update(np.unique(mask))
-        # print("Unique mask values:", unique_vals)
+        # Cityscapes parameters
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+        base_size = [256, 256]  # Matches your actual data dimensions
+        crop_size = [256, 256]
+        scale_range = [0.5, 2.0]
+        self.ignore_index = 255  # Keep original ignore index
 
-    def __len__(self):
-        return len(self.file_list)
+        if transform is None:
+            transform_list = []
+            if split == 'train':
+                if random_horizontal_flip:
+                    transform_list.append(RandomHorizontalFlip())
+                if random_gaussian_blur:
+                    transform_list.append(RandomGaussianBlur())
+                if random_enhance:
+                    transform_list.append(RandomEnhance())
+
+                transform_list += [
+                    RandomScaleRandomCrop(base_size, crop_size, scale_range, self.ignore_index),
+                    Normalize(mean=mean, std=std),
+                    ToTensor()
+                ]
+            else:
+                transform_list = [
+                    FixedScaleCenterCrop(base_size),
+                    Normalize(mean=mean, std=std),
+                    ToTensor()
+                ]
+
+                if split == 'val':
+                    transform_list.append(MultiScale([1.0]))
+                    transform_list.append(Flip())
+
+            self.transform = transforms.Compose(transform_list)
+        else:
+            self.transform = transform
 
     def __getitem__(self, idx):
-        fname = self.file_list[idx]
-        
-        # Load and preprocess image
-        img = np.load(os.path.join(self.image_dir, fname))
-        img = cv2.resize(img, (473, 473), interpolation=cv2.INTER_LINEAR)
-        
-        # Load and process mask
-        mask = np.load(os.path.join(self.label_dir, fname))
-        mask = cv2.resize(mask, (473, 473), interpolation=cv2.INTER_NEAREST)
-        
-        # Remap labels using class mapping
-        remapped = np.vectorize(lambda x: self.class_mapping[x])(mask).astype(np.uint8)
-        
-        sample = {
-            'image': {'original_scale': img},
-            'label': {'semantic_logit': remapped},
-            'filename': fname
-        }
-        return self.transform(sample)
+        filename = self.filenames[idx]
+        image = np.load(os.path.join(self.image_dir, filename))
+        label = np.load(os.path.join(self.label_dir, filename)).astype(np.int32)  # Use int32 instead of int64
 
-class Normalize:
-    def __init__(self, mean, std):
-        self.mean = np.array(mean)
-        self.std = np.array(std)
-
-    def __call__(self, sample):
-        img = sample['image']['original_scale']
-        img = (img - self.mean) / self.std
-        sample['image']['original_scale'] = img
-        return sample
-
-class ToTensor:
-    def __call__(self, sample):
-        img = sample['image']['original_scale']
-        label = sample['label']['semantic_logit']
+        # Convert and validate labels before any transformations
+        label = np.where(label == 255, -1, label)
+        label = np.clip(label, -1, 18)
         
-        # Add channel dimension for images (assuming input is HxWxC)
-        if len(img.shape) == 2:
-            img = np.expand_dims(img, axis=-1)
+        # Convert to int32 explicitly
+        label = label.astype(np.int32)
+        
+        # Verify dtype and value range before transformations
+        if label.dtype != np.int32:
+            raise TypeError(f"Label dtype {label.dtype} is not int32 in {filename}")
             
-        sample['image']['original_scale'] = torch.from_numpy(img.transpose(2, 0, 1)).float()
-        sample['label']['semantic_logit'] = torch.from_numpy(label).long()
+        # Strict validation with enhanced error reporting
+        unique_labels, counts = np.unique(label, return_counts=True)
+        invalid_mask = (unique_labels < -1) | (unique_labels >= 19)
+        
+        if np.any(invalid_mask):
+            invalid_values = unique_labels[invalid_mask]
+            invalid_counts = counts[invalid_mask]
+            invalid_total = np.sum(invalid_counts)
+            
+            print(f"Critical error in {filename}:")
+            print(f"Invalid values: {invalid_values.tolist()}")
+            print(f"Total invalid pixels: {invalid_total}")
+            print("Value distribution:")
+            for v, c in zip(unique_labels, counts):
+                print(f"Class {v}: {c} pixels")
+            
+            # Find first invalid coordinate
+            first_invalid = np.argwhere(np.isin(label, invalid_values))[0]
+            print(f"First invalid coordinate: {first_invalid}")
+            
+            # Visualize problematic area
+            h, w = label.shape
+            y_start = max(0, first_invalid[0]-2)
+            y_end = min(h, first_invalid[0]+3)
+            x_start = max(0, first_invalid[1]-2)
+            x_end = min(w, first_invalid[1]+3)
+            print("Problematic region:")
+            print(label[y_start:y_end, x_start:x_end])
+            
+            raise ValueError(f"Invalid labels {invalid_values} in {filename}")
+
+        # Apply transformations AFTER validation
+        sample = {
+            'image': {'original_scale': image},
+            'label': {'semantic_logit': label},
+            'filename': filename
+        }
+        
+        if self.transform:
+            sample = self.transform(sample)
+            
+            # Additional validation after transformations
+            transformed_label = sample['label']['semantic_logit'].numpy()
+            unique_transformed = np.unique(transformed_label)
+            invalid_transformed = (unique_transformed < -1) | (unique_transformed >= 19)
+            
+            if np.any(invalid_transformed):
+                raise RuntimeError(
+                    f"Transformations introduced invalid labels in {filename}: "
+                    f"{unique_transformed[invalid_transformed]}"
+                )
+
         return sample
+
+    def __len__(self):
+        return len(self.filenames)
 
 def load_data(args):
-    # Load full training dataset
-    full_train = CityscapesDataset(args, split='train')
+    full_train_dataset = CityscapesDataset(split='train')
+    train_size = int(0.8 * len(full_train_dataset))
+    test_size = len(full_train_dataset) - train_size
     
-    # Split into 80% train, 20% test
-    train_size = int(0.8 * len(full_train))
-    test_size = len(full_train) - train_size
-    train_dataset, test_dataset = random_split(full_train, [train_size, test_size])
+    train_dataset, test_dataset = random_split(
+        full_train_dataset, 
+        [train_size, test_size],
+        generator=torch.Generator().manual_seed(42)
+    )
     
-    # Load validation dataset
-    val_dataset = CityscapesDataset(args, split='val')
+    val_dataset = CityscapesDataset(split='val')
 
-    # Create dataloaders
+    if args.distributed:
+        torch.cuda.set_device(args.local_rank)
+        dist.init_process_group(backend='nccl')
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    else:
+        train_sampler = None
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
+        batch_size=args.batch_size * args.device_num if not args.distributed else args.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=args.num_workers,
+        drop_last=True,
         pin_memory=True
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         num_workers=args.num_workers,
-        shuffle=False
+        drop_last=True
     )
-    
+
     test_loader = DataLoader(
         test_dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         num_workers=args.num_workers,
-        shuffle=False
+        drop_last=True
     )
 
     return train_loader, val_loader, test_loader

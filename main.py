@@ -1,13 +1,13 @@
 import torch
-from utils import decode_semantic_label
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import _LRScheduler
+from torchvision import transforms
 
 from model import PSPNet
 from config import load_config
 from preprocess import load_data
-from utils import SegmentationLosses, calculate_weigths_labels, SemanticSegmentationMetrics
+from utils import decode_semantic_label, SemanticSegmentationMetrics
 
 import os
 import numpy as np
@@ -18,63 +18,57 @@ def save_checkpoint(model, optimizer, scheduler, args, global_step, scope=None):
         scope = global_step
 
     if args.distributed is False or args.local_rank == 0:
-        if args.device_num > 1:
-            model_state_dict = model.module.state_dict()
-        else:
-            model_state_dict = model.state_dict()
-
+        model_state_dict = model.module.state_dict() if args.device_num > 1 else model.state_dict()
+        
         torch.save({
             'model_state_dict': model_state_dict,
             'global_step': global_step,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict()
-        }, os.path.join('checkpoint', 'checkpoint_model_{}.pth'.format(scope)))
+        }, os.path.join('checkpoint', f'checkpoint_model_{scope}.pth'))
 
 class PolyLr(_LRScheduler):
     def __init__(self, optimizer, gamma, max_iteration, warmup_iteration=0, last_epoch=-1):
         self.gamma = gamma
         self.max_iteration = max_iteration
         self.warmup_iteration = warmup_iteration
-
-        super(PolyLr, self).__init__(optimizer, last_epoch)
+        super().__init__(optimizer, last_epoch)
 
     def poly_lr(self, base_lr, step):
-        return base_lr * ((1 - (step / self.max_iteration)) ** (self.gamma))
+        ratio = max(0.0, 1.0 - (step / self.max_iteration))
+        return base_lr * (ratio ** self.gamma)
 
     def warmup_lr(self, base_lr, alpha):
-        return base_lr * (1 / 10.0 * (1 - alpha) + alpha)
+        return base_lr * ((1 - alpha)/10.0 + alpha)
 
     def get_lr(self):
         if self.last_epoch < self.warmup_iteration:
             alpha = self.last_epoch / self.warmup_iteration
-            lrs = [min(self.warmup_lr(base_lr, alpha), self.poly_lr(base_lr, self.last_epoch)) 
-                   for base_lr in self.base_lrs]
-        else:
-            lrs = [self.poly_lr(base_lr, self.last_epoch) for base_lr in self.base_lrs]
-        return lrs
+            return [
+                min(self.warmup_lr(base_lr, alpha), self.poly_lr(base_lr, self.last_epoch))
+                for base_lr in self.base_lrs
+            ]
+        return [self.poly_lr(base_lr, self.last_epoch) for base_lr in self.base_lrs]
 
 def train(global_step, train_loader, model, optimizer, criterion, scheduler, args):
     model.train()
     metric = SemanticSegmentationMetrics(args)
+    
     for data in train_loader:
         if global_step > args.max_iteration:
             break
-        print('[Global Step: {0}]'.format(global_step), end=' ')
-        img, label = data['image'], data['label']['semantic_logit']
-
-        if args.cuda:
-            for key in img.keys():
-                img[key] = img[key].cuda()
-            label = label.cuda()
+            
+        img = {k: v.cuda() for k, v in data['image'].items()} if args.cuda else data['image']
+        label = data['label']['semantic_logit'].cuda() if args.cuda else data['label']['semantic_logit']
 
         logit, loss = model(img, label.long())
-        evaluation = metric(logit, label, mode='train')
-        print('[Loss: {0:.4f}], [Acc: {1:.3f}], [mAcc: {2:.3f}], [mIoU: {3:.3f}]'.format(
-            loss.item(), 
-            evaluation['accuracy'],
-            evaluation['mean_pixel_accuracy'],
-            evaluation['mean_iou']
-        ))
+        evaluation = metric(logit, label)
+        
+        print(f'[Global Step: {global_step}] '
+              f'[Loss: {loss.item():.4f}], '
+              f'[Acc: {evaluation["accuracy"]:.3f}], '
+              f'[mAcc: {evaluation["mean_pixel_accuracy"]:.3f}], '
+              f'[mIoU: {evaluation["mean_iou"]:.3f}]')
 
         optimizer.zero_grad()
         loss.backward()
@@ -83,40 +77,38 @@ def train(global_step, train_loader, model, optimizer, criterion, scheduler, arg
         
         if global_step % args.intervals == 0:
             save_checkpoint(model, optimizer, scheduler, args, global_step)
+            
         global_step += 1
+        
     return global_step
 
 def eval(loader, model, args, mode='val'):
     metric = SemanticSegmentationMetrics(args)
     metric.reset()
     model.eval()
+    
     with torch.no_grad():
         for idx, data in enumerate(loader):
-            img, label = data['image'], data['label']['semantic_logit']
-            if args.cuda:
-                for key in img.keys():
-                    img[key] = img[key].cuda()
-                label = label.cuda()
+            img = {k: v.cuda() for k, v in data['image'].items()} if args.cuda else data['image']
+            label = data['label']['semantic_logit'].cuda() if args.cuda else data['label']['semantic_logit']
 
             logit = model(img)
-            evaluation = metric(logit, label, mode)
+            evaluation = metric(logit, label)
             
-            if idx % 10 == 0:  # Reduce printing frequency
-                print(f'[{mode.upper()}][{idx+1}/{len(loader)}] ' +
-                      f'mIoU: {evaluation["mean_iou"]:.3f} ' +
-                      f'Acc: {evaluation["accuracy"]:.3f} ' +
+            if idx % 10 == 0:
+                print(f'[{mode.upper()}][{idx+1}/{len(loader)}] '
+                      f'mIoU: {evaluation["mean_iou"]:.3f} '
+                      f'Acc: {evaluation["accuracy"]:.3f} '
                       f'mAcc: {evaluation["mean_pixel_accuracy"]:.3f}')
 
             if args.result_save and mode == 'test':
-                if not os.path.isdir('result'):
-                    os.mkdir('result')
-                pred = logit.squeeze().detach().cpu().numpy()
-                pred = decode_semantic_label(pred)
-                pred *= np.stack([(label.squeeze().detach().cpu().numpy() != 255).astype(float)] * 3, axis=-1)
-                cv2.imwrite(os.path.join('result', data['filename'][0]), pred.astype(np.uint8))
-    
+                os.makedirs('result', exist_ok=True)
+                pred = logit.argmax(1).squeeze().cpu().numpy()
+                pred_viz = decode_semantic_label(pred)
+                cv2.imwrite(os.path.join('result', data['filename'][0]), pred_viz)
+
     final_metrics = {
-        'mIoU': metric.compute_mean_iou(),
+        'mIoU': metric.compute_iou(),
         'accuracy': metric.compute_pixel_accuracy(),
         'mean_pixel_accuracy': metric.compute_mean_pixel_accuracy()
     }
@@ -129,10 +121,8 @@ def eval(loader, model, args, mode='val'):
     return final_metrics
 
 def main(args):
-    # Load all three datasets
     train_loader, val_loader, test_loader = load_data(args)
     
-    # Initialize model with Cityscapes classes
     model = PSPNet(n_classes=args.n_classes)
     
     if args.cuda:
@@ -140,37 +130,32 @@ def main(args):
     if args.distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = nn.parallel.DistributedDataParallel(
-            model, 
+            model,
             device_ids=[args.local_rank],
-            output_device=args.local_rank,
-            find_unused_parameters=True
+            output_device=args.local_rank
         )
 
     if args.evaluation:
-        checkpoint = torch.load('./checkpoint/checkpoint_model_50000.pth', map_location='cpu')
+        checkpoint = torch.load('./checkpoint/checkpoint_model_2000.pth', map_location='cpu')
         model.load_state_dict(checkpoint['model_state_dict'])
+        
         print("\nEvaluating on validation set:")
-        eval(val_loader, model, args, mode='val')
+        eval(val_loader, model, args, 'val')
         print("\nEvaluating on test set:")
-        eval(test_loader, model, args, mode='test')
+        eval(test_loader, model, args, 'test')
     else:
         criterion = nn.CrossEntropyLoss(
-            ignore_index=args.ignore_mask, 
-            weight=None  # Add class weights here if needed
+            ignore_index=args.ignore_mask,
+            reduction='mean'
         ).cuda()
 
-        # Parameter grouping
-        backbone_params = []
-        decoder_params = []
-        for name, param in model.named_parameters():
-            if 'backbone' in name:
-                backbone_params.append(param)
-            else:
-                decoder_params.append(param)
-
+        params = [
+            {'params': [p for n, p in model.named_parameters() if 'backbone' in n]},
+            {'params': [p for n, p in model.named_parameters() if 'backbone' not in n], 'lr': args.lr * 10}
+        ]
+        
         optimizer = optim.SGD(
-            [{'params': backbone_params},
-             {'params': decoder_params, 'lr': args.lr * 10}],
+            params,
             lr=args.lr,
             momentum=args.momentum,
             weight_decay=args.weight_decay,
@@ -178,24 +163,22 @@ def main(args):
         )
         
         scheduler = PolyLr(
-            optimizer, 
+            optimizer,
             gamma=args.gamma,
             max_iteration=args.max_iteration,
             warmup_iteration=args.warmup_iteration
         )
 
         global_step = 0
-        if not os.path.isdir('checkpoint'):
-            os.mkdir('checkpoint')
-            
+        os.makedirs('checkpoint', exist_ok=True)
+        
         while global_step < args.max_iteration:
             global_step = train(global_step, train_loader, model, optimizer, criterion, scheduler, args)
-        
-        # Final evaluation after training
+
         print("\nFinal Validation Evaluation:")
-        eval(val_loader, model, args, mode='val')
+        eval(val_loader, model, args, 'val')
         print("\nFinal Test Evaluation:")
-        eval(test_loader, model, args, mode='test')
+        eval(test_loader, model, args, 'test')
 
 if __name__ == '__main__':
     args = load_config()

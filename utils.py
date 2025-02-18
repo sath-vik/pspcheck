@@ -261,3 +261,39 @@ def calculate_weigths_labels(dataset, dataloader, num_classes):
         counts = np.bincount(labels[valid], minlength=num_classes)
         z += counts
     return torch.from_numpy(1 / np.log(1.02 + z / z.sum())).float()
+
+import csv
+import os
+
+class TrainingLogger:
+    def __init__(self, file_path='training_log.csv'):
+        self.file_path = file_path
+        self.headers = [
+            'epoch', 'phase', 'lr', 'loss', 
+            'iou', 'val_loss', 'val_iou', 'val_acc', 'val_macc'
+        ]
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        # Write headers if file doesn't exist
+        if not os.path.exists(self.file_path):
+            with open(self.file_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=self.headers)
+                writer.writeheader()
+                
+    def log(self, epoch, phase, lr=None, loss=None, iou=None, 
+            val_loss=None, val_iou=None, val_acc=None, val_macc=None):
+        entry = {
+            'epoch': epoch,
+            'phase': phase,
+            'lr': lr if lr is not None else '',
+            'loss': loss if loss is not None else '',
+            'iou': iou if iou is not None else '',
+            'val_loss': val_loss if val_loss is not None else '',
+            'val_iou': val_iou if val_iou is not None else '',
+            'val_acc': val_acc if val_acc is not None else '',
+            'val_macc': val_macc if val_macc is not None else ''
+        }
+        
+        with open(self.file_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self.headers)
+            writer.writerow(entry)

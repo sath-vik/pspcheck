@@ -105,7 +105,13 @@ def eval(loader, model, args, mode='val'):
                 os.makedirs('result', exist_ok=True)
                 pred = logit.argmax(1).squeeze().cpu().numpy()
                 pred_viz = decode_semantic_label(pred)
-                cv2.imwrite(os.path.join('result', data['filename'][0]), pred_viz)
+                
+                # Convert .npy filename to .png
+                original_name = data['filename'][0]
+                base_name = os.path.splitext(original_name)[0]
+                output_filename = f"{base_name}.png"
+                
+                cv2.imwrite(os.path.join('result', output_filename), pred_viz)
 
     final_metrics = {
         'mIoU': metric.compute_iou(),
@@ -119,6 +125,7 @@ def eval(loader, model, args, mode='val'):
     print(f'• Mean Pixel Accuracy: {final_metrics["mean_pixel_accuracy"]:.4f}')
     
     return final_metrics
+
 
 def main(args):
     train_loader, val_loader, test_loader = load_data(args)
